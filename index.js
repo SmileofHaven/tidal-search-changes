@@ -2064,6 +2064,8 @@
             cover_url: coverUrl,
             source_type: "tidal",
             external_id: String(track.id), // Used to fetch stream on play
+            track_number: track.trackNumber || null,
+            disc_number: track.volumeNumber || null,
             format: track.mediaMetadata?.tags?.includes("HIRES_LOSSLESS")
               ? "HI_RES_LOSSLESS"
               : track.mediaMetadata?.tags?.includes("LOSSLESS")
@@ -2766,6 +2768,8 @@
             cover_url: coverUrl,
             source_type: "tidal",
             external_id: String(track.id),
+            track_number: track.trackNumber || null,
+            disc_number: track.volumeNumber || null,
             format: track.mediaMetadata?.tags?.includes("HIRES_LOSSLESS")
               ? "HI_RES_LOSSLESS"
               : track.mediaMetadata?.tags?.includes("LOSSLESS")
@@ -2906,3 +2910,4 @@
     window.tidalSearchPlugin = TidalSearch;
   }
 })();
+
