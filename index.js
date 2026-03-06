@@ -2,34 +2,30 @@
 // Search and browse tracks from the Tidal catalog with full playback integration
 
 (function () {
-  // Import appSettings from Svelte store (native app settings)
-  let appSettings = null;
-  try {
-    // Dynamically require if possible (for Tauri context)
-    appSettings =
-      window.__TAURI__ && window.appSettings ? window.appSettings : null;
-  } catch (e) {
-    appSettings = null;
-  }
-  ("use strict");
+  "use strict";
 
-  // API Configuration - Multiple endpoints for different services
-  const API_ENDPOINTS = {
-    SEARCH: [
-      "https://hund.qqdl.site",
-      "https://katze.qqdl.site",
-      "https://tidal.kinoplus.online",
-      "https://maus.qqdl.site",
-      "https://arran.monochrome.tf"
-    ],
-    DETAILS: "https://triton.squid.wtf",         // Artist/Album details
-    STREAM: "https://katze.qqdl.site"            // Stream/playback endpoint
-  };
+  const ALL_MIRRORS = [
+    "https://hifi-one.spotisaver.net",
+    "https://hifi-two.spotisaver.net",
+    "https://maus.qqdl.site",
+    "https://katze.qqdl.site",
+    "https://vogel.qqdl.site",
+    "https://hund.qqdl.site",
+    "https://wolf.qqdl.site",
+  ];
 
-  // Helper function to get a random search endpoint
-  function getRandomSearchEndpoint() {
-    const searchEndpoints = API_ENDPOINTS.SEARCH;
-    return searchEndpoints[Math.floor(Math.random() * searchEndpoints.length)];
+  const ALL_SEARCH_MIRRORS = [
+    ...ALL_MIRRORS,
+    "https://tidal.kinoplus.online",
+  ];
+
+  function shuffled(arr) {
+    const a = [...arr];
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -78,20 +74,13 @@
             externalId,
           );
           try {
-            const quality = options?.quality || "LOSSLESS";
-            let streamData = await this.fetchStream(externalId, quality);
-
-            // Handle MPD fallback
-            if (streamData?.data?.manifestMimeType === "application/dash+xml") {
-              streamData = await this.fetchStream(externalId, "LOSSLESS");
-              if (
-                streamData?.data?.manifestMimeType === "application/dash+xml"
-              ) {
-                streamData = await this.fetchStream(externalId, "HIGH");
-              }
-            }
-
+            const quality = options?.quality || "HI_RES_LOSSLESS";
+            // fetchStream handles mirror rotation and full quality fallback chain
+            const streamData = await this.fetchStream(externalId, quality);
             const streamUrl = this.decodeManifest(streamData.data);
+            if (streamUrl?.startsWith("blob:")) {
+              setTimeout(() => URL.revokeObjectURL(streamUrl), 5000);
+            }
             return streamUrl;
           } catch (err) {
             console.error("[TidalSearch] Failed to resolve stream:", err);
@@ -1366,18 +1355,30 @@
           param = "al"; // Album search
         }
 
-        const url = `${getRandomSearchEndpoint()}/search/?${param}=${encodeURIComponent(query)}`;
+        let data = null;
 
-        // Use CORS-free fetch via Tauri backend
-        const response = this.api.fetch
-          ? await this.api.fetch(url)
-          : await fetch(url);
+        for (const baseUrl of shuffled(ALL_SEARCH_MIRRORS)) {
+          try {
+            const url = `${baseUrl}/search/?${param}=${encodeURIComponent(query)}`;
+            // Use CORS-free fetch via Tauri backend
+            const response = this.api.fetch
+              ? await this.api.fetch(url)
+              : await fetch(url);
 
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
+            if (!response.ok) {
+              console.warn(`[TidalSearch] Search failed on ${baseUrl}: HTTP ${response.status}`);
+              continue;
+            }
+
+            data = await response.json();
+            console.log(`[TidalSearch] Search OK from ${baseUrl}`);
+            break;
+          } catch (e) {
+            console.warn(`[TidalSearch] Search error on ${baseUrl}:`, e.message);
+          }
         }
 
-        const data = await response.json();
+        if (!data) throw new Error("All search mirrors failed");
         this.currentResults = data;
 
         // Render based on mode
@@ -1771,86 +1772,73 @@
 
     async playTrack(track, element) {
       console.log("[TidalSearch] Playing track:", track.title);
-
+    
       // Show loading state
       if (element) {
         element.classList.add("loading");
       }
-
+    
       try {
-        // Get selected quality
-        let quality =
-          document.getElementById("tidal-quality")?.value || "LOSSLESS";
-
-        // Fetch stream
-        let streamData = await this.fetchStream(track.id, quality);
-
-        // Check if it's MPD (DASH) format - native audio can't play this
-        if (streamData?.data?.manifestMimeType === "application/dash+xml") {
-          console.log("[TidalSearch] MPD detected, falling back to LOSSLESS");
-          this.showToast("Hi-Res uses DASH, trying Lossless...");
-
-          // Try LOSSLESS instead
-          if (quality === "HI_RES_LOSSLESS") {
-            quality = "LOSSLESS";
-            streamData = await this.fetchStream(track.id, quality);
-          }
-
-          // If still MPD, try HIGH
-          if (streamData?.data?.manifestMimeType === "application/dash+xml") {
-            quality = "HIGH";
-            streamData = await this.fetchStream(track.id, quality);
-          }
-        }
-
+        const quality =
+          document.getElementById("tidal-quality")?.value || "HI_RES_LOSSLESS";
+    
+        // fetchStream handles mirror rotation and full quality fallback chain
+        const streamData = await this.fetchStream(track.id, quality);
+    
         if (!streamData?.data?.manifest) {
           throw new Error("No manifest in response");
         }
-
-        // Decode manifest to get stream URL
+    
+        // decodeManifest returns either a direct CDN URL (FLAC/AAC)
+        // or a blob: URL containing the MPD XML (Hi-Res DASH)
         const streamUrl = this.decodeManifest(streamData.data);
-
+    
         if (!streamUrl) {
           throw new Error("Could not extract stream URL");
         }
-
-        console.log("[TidalSearch] Stream URL:", streamUrl);
-
-        // Use the app's player API instead of querying a DOM <audio> element.
-        // The player will call our registered stream resolver to obtain `streamUrl`.
+    
+        const isMpd = streamData.data.manifestMimeType === "application/dash+xml";
+        const actualQuality = isMpd
+          ? "HI_RES_LOSSLESS"
+          : streamData.data.audioQuality || "LOSSLESS";
+    
+        console.log(`[TidalSearch] Stream URL (${actualQuality}):`, streamUrl);
+    
         // Update current playing track
         this.isPlaying = track.id;
-
+    
         // Create Audion-compatible track object
         const artistName =
           track.artist?.name || track.artists?.[0]?.name || "Unknown Artist";
         const coverUrl = track.album?.cover
           ? `https://resources.tidal.com/images/${track.album.cover.replace(/-/g, "/")}/320x320.jpg`
           : null;
-
+    
         const audionTrack = {
           id: track.id,
-          path: streamUrl, // Use stream URL as path (player will prefer resolving via stream resolver)
+          path: isMpd ? `tidal://${track.id}` : streamUrl,
+          source_type: 'tidal',
           title: track.title + (track.version ? ` (${track.version})` : ""),
           artist: artistName,
           album: track.album?.title || null,
           duration: track.duration || null,
           cover_url: coverUrl,
           tidal_id: track.id,
-          format: streamData?.data?.audioQuality || "LOSSLESS",
-          bitrate: streamData?.data?.sampleRate || null,
+          format: actualQuality,
+          bitrate: streamData.data.sampleRate || null,
         };
-
+    
         // Set track via the plugin API (this triggers app playback and emits trackChange)
         if (this.api?.player?.setTrack) {
           this.api.player.setTrack(audionTrack);
         } else {
           console.warn('[TidalSearch] player.setTrack not available');
         }
-
+    
         // Show toast notification
-        this.showToast(`▶ ${audionTrack.title} - ${artistName}`);
-
+        const qualityLabel = isMpd ? "Hi-Res" : actualQuality === "LOSSLESS" ? "Lossless" : actualQuality;
+        this.showToast(`▶ ${audionTrack.title} - ${artistName} [${qualityLabel}]`);
+    
         // Update track items to show playing state
         document.querySelectorAll(".tidal-track-item").forEach((el) => {
           el.classList.toggle(
@@ -1869,17 +1857,47 @@
     },
 
     async fetchStream(trackId, quality) {
-      const url = `${API_ENDPOINTS.STREAM}/track/?id=${trackId}&quality=${quality}`;
+      const QUALITY_FALLBACKS = {
+        "HI_RES_LOSSLESS": ["LOSSLESS", "HIGH", "LOW"],
+        "LOSSLESS":         ["HIGH", "LOW"],
+        "HIGH":             ["LOSSLESS", "LOW"],
+        "LOW":              ["HIGH", "LOSSLESS"],
+      };
 
-      // Use CORS-free fetch via Tauri backend
-      const response = this.api.fetch
-        ? await this.api.fetch(url)
-        : await fetch(url);
+      const qualitiesToTry = [quality, ...(QUALITY_FALLBACKS[quality] || [])];
 
-      if (!response.ok) {
-        throw new Error(`Failed to get stream: HTTP ${response.status}`);
+      for (const currentQuality of qualitiesToTry) {
+        for (const baseUrl of shuffled(ALL_MIRRORS)) {
+          const url = `${baseUrl}/track/?id=${trackId}&quality=${currentQuality}`;
+          try {
+            // Use CORS-free fetch via Tauri backend
+            const response = this.api.fetch
+              ? await this.api.fetch(url)
+              : await fetch(url);
+
+            if (!response.ok) {
+              if (response.status === 403 || response.status === 503) continue;
+              throw new Error(`HTTP ${response.status}`);
+            }
+
+            const data = await response.json();
+
+            if (!data?.data?.manifest) {
+              console.warn(`[TidalSearch] No manifest from ${baseUrl} @ ${currentQuality}`);
+              continue;
+            }
+
+            console.log(`[TidalSearch] Stream OK: ${baseUrl} @ ${currentQuality}`);
+            return data;
+
+          } catch (e) {
+            console.warn(`[TidalSearch] Mirror failed ${baseUrl} @ ${currentQuality}:`, e.message);
+          }
+        }
+        console.warn(`[TidalSearch] All mirrors failed @ ${currentQuality}, trying next tier...`);
       }
-      return await response.json();
+
+      throw new Error("[TidalSearch] All mirrors and quality tiers exhausted");
     },
 
     // covers for RPC
@@ -1887,18 +1905,23 @@
     async searchCoverForRPC(title, artist, trackId) {
       try {
         const query = `${title} ${artist}`;
-        const url = `${getRandomSearchEndpoint()}/search/?s=${encodeURIComponent(query)}`;
+        let data = null;
 
-        const response = this.api.fetch
-          ? await this.api.fetch(url)
-          : await fetch(url);
-
-        if (!response.ok) {
-          console.log("[TidalSearch] Cover search failed:", response.status);
-          return null;
+        for (const baseUrl of shuffled(ALL_SEARCH_MIRRORS)) {
+          try {
+            const url = `${baseUrl}/search/?s=${encodeURIComponent(query)}`;
+            const response = this.api.fetch
+              ? await this.api.fetch(url)
+              : await fetch(url);
+            if (!response.ok) continue;
+            data = await response.json();
+            break;
+          } catch (e) {
+            console.warn(`[TidalSearch] Cover search failed on ${baseUrl}:`, e.message);
+          }
         }
 
-        const data = await response.json();
+        if (!data) return null;
         const items = data?.data?.items || [];
 
         if (items.length > 0 && items[0].album?.cover) {
@@ -1966,18 +1989,23 @@
         }
 
         // Fetch from Tidal API
-        const url = `${getRandomSearchEndpoint()}/search/?a=${encodeURIComponent(artistName)}`;
+        let data = null;
 
-        const response = this.api.fetch
-          ? await this.api.fetch(url)
-          : await fetch(url);
-
-        if (!response.ok) {
-          console.log("[TidalSearch] Artist picture search failed:", response.status);
-          return null;
+        for (const baseUrl of shuffled(ALL_SEARCH_MIRRORS)) {
+          try {
+            const url = `${baseUrl}/search/?a=${encodeURIComponent(artistName)}`;
+            const response = this.api.fetch
+              ? await this.api.fetch(url)
+              : await fetch(url);
+            if (!response.ok) continue;
+            data = await response.json();
+            break;
+          } catch (e) {
+            console.warn(`[TidalSearch] Artist picture search failed on ${baseUrl}:`, e.message);
+          }
         }
 
-        const data = await response.json();
+        if (!data) return null;
         const artists = data?.data?.artists?.items || [];
 
         if (artists.length > 0 && artists[0].picture) {
@@ -2150,17 +2178,23 @@
         if (manifestMimeType === "application/vnd.tidal.bts") {
           // JSON manifest for FLAC/AAC
           const manifest = JSON.parse(manifestStr);
-          console.log("[TidalSearch] Decoded BTS manifest:", manifest);
+          console.log("[TidalSearch] Stream details:", {
+            mimeType: manifestMimeType,
+            audioQuality: data.audioQuality,
+            sampleRate: data.sampleRate,
+            bitDepth: data.bitDepth,
+            codec: manifest.codecs,
+            encryptionType: manifest.encryptionType,
+            url: manifest.urls?.[0]?.substring(0, 60) + "...",
+          });
 
           if (manifest.urls && manifest.urls.length > 0) {
             return manifest.urls[0];
           }
         } else if (manifestMimeType === "application/dash+xml") {
-          // MPD manifest for Hi-Res - can't play directly
-          console.warn(
-            "[TidalSearch] MPD manifest not supported by native audio",
-          );
-          return null;
+          console.log("[TidalSearch] MPD manifest, returning as blob URL for dash.js");
+          const blob = new Blob([manifestStr], { type: "application/dash+xml" });
+          return URL.createObjectURL(blob);
         }
 
         return null;
@@ -2220,22 +2254,29 @@
     },
 
     async fetchAndRenderArtistPage(artistId) {
+      this.showAllArtistTracks = false;
+      this.showAllArtistAlbums = false;
       this.showLoading();
 
       try {
-        const url = `${API_ENDPOINTS.DETAILS}/artist/?f=${artistId}`;
+        let data = null;
 
-        const response = this.api.fetch
-          ? await this.api.fetch(url)
-          : await fetch(url);
-
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
+        for (const baseUrl of shuffled(ALL_MIRRORS)) {
+          try {
+            const url = `${baseUrl}/artist/?f=${artistId}`;
+            const response = this.api.fetch
+              ? await this.api.fetch(url)
+              : await fetch(url);
+            if (!response.ok) continue;
+            data = await response.json();
+            console.log(`[TidalSearch] Artist data from ${baseUrl}`);
+            break;
+          } catch (e) {
+            console.warn(`[TidalSearch] Artist fetch failed on ${baseUrl}:`, e.message);
+          }
         }
 
-        const data = await response.json();
-        console.log("[TidalSearch] Artist data:", data);
-
+        if (!data) throw new Error("All mirrors failed to fetch artist");
         this.renderArtistPage(data);
       } catch (err) {
         console.error("[TidalSearch] Failed to fetch artist:", err);
@@ -2273,19 +2314,24 @@
       this.showLoading();
 
       try {
-        const url = `${API_ENDPOINTS.DETAILS}/album/?id=${albumId}`;
+        let data = null;
 
-        const response = this.api.fetch
-          ? await this.api.fetch(url)
-          : await fetch(url);
-
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
+        for (const baseUrl of shuffled(ALL_MIRRORS)) {
+          try {
+            const url = `${baseUrl}/album/?id=${albumId}`;
+            const response = this.api.fetch
+              ? await this.api.fetch(url)
+              : await fetch(url);
+            if (!response.ok) continue;
+            data = await response.json();
+            console.log(`[TidalSearch] Album data from ${baseUrl}`);
+            break;
+          } catch (e) {
+            console.warn(`[TidalSearch] Album fetch failed on ${baseUrl}:`, e.message);
+          }
         }
 
-        const data = await response.json();
-        console.log("[TidalSearch] Album data:", data);
-
+        if (!data) throw new Error("All mirrors failed to fetch album");
         this.renderAlbumPage(data);
       } catch (err) {
         console.error("[TidalSearch] Failed to fetch album:", err);
@@ -2304,24 +2350,26 @@
         this.currentView = "search";
         this.searchMode = previousView.mode;
         this.currentResults = previousView.results;
-
+      
         // Restore search input
         const input = document.querySelector(".tidal-search-input");
         if (input) input.value = previousView.query;
-
+      
         // Restore results
         if (this.searchMode === "track") {
           this.renderTrackResults(previousView.results);
-        } else {
+        } else if (this.searchMode === "artist") {
           this.renderArtistResults(previousView.results);
+        } else if (this.searchMode === "album") {
+          this.renderAlbumResults(previousView.results);
         }
-
+      
         // Restore scroll position
         setTimeout(() => {
           const container = document.querySelector(".tidal-results-container");
           if (container) container.scrollTop = previousView.scrollPosition;
         }, 0);
-
+      
         this.updatePanelTitle("Tidal Search");
       } else if (previousView.type === "artist" && previousView.data) {
         // Restore artist view
