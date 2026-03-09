@@ -5,7 +5,6 @@
   "author": "Audion Team",
   "description": "Search and browse tracks from the Tidal catalog",
   "repo": "https://github.com/dupitydumb/tidal-search",
-  "manifest_url": null,
   "type": "js",
   "entry": "index.js",
   "permissions": [
