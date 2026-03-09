@@ -18,8 +18,6 @@
     "library:downloadTrack"
   ],
   "cross_plugin_access": [],
-  "ui_slots": null,
-  "icon": null,
   "category": "library",
   "tags": [
     "search",
