@@ -4,20 +4,32 @@
 (function () {
   "use strict";
 
-  const ALL_MIRRORS = [
-    "https://hifi-one.spotisaver.net",
-    "https://hifi-two.spotisaver.net",
-    "https://maus.qqdl.site",
-    "https://katze.qqdl.site",
-    "https://vogel.qqdl.site",
-    "https://hund.qqdl.site",
-    "https://wolf.qqdl.site",
-  ];
+  // API Configuration - Multiple endpoints for different services
+  const API_ENDPOINTS = {
+    SEARCH: [
+      "https://hund.qqdl.site",
+      "https://katze.qqdl.site",
+      "https://tidal.kinoplus.online",
+      "https://maus.qqdl.site",
+      "https://arran.monochrome.tf"
+    ],
+    DETAILS: "https://triton.squid.wtf",
+    STREAM: [
+      "https://hifi-two.spotisaver.net",
+      "https://triton.squid.wtf",
+      "https://vogel.qqdl.site",
+      "https://tidal.kinoplus.online",
+      "https://katze.qqdl.site",
+      "https://arran.monochrome.tf"
+    ]
+  };
 
-  const ALL_SEARCH_MIRRORS = [
-    ...ALL_MIRRORS,
-    "https://tidal.kinoplus.online",
+  const UPTIME_ENDPOINT_SOURCES = [
+    "https://tidal-uptime.jiffy-puffs-1j.workers.dev/",
+    "https://tidal-uptime.props-76styles.workers.dev/"
   ];
+  const ENDPOINT_CACHE_KEY = "tidal-search:endpoint-cache:v1";
+  const ENDPOINT_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 1 day
 
   function shuffled(arr) {
     const a = [...arr];
@@ -26,6 +38,15 @@
       [a[i], a[j]] = [a[j], a[i]];
     }
     return a;
+  }
+
+  function getRandomSearchEndpoint() {
+    const searchEndpoints = API_ENDPOINTS.SEARCH;
+    return searchEndpoints[Math.floor(Math.random() * searchEndpoints.length)];
+  }
+
+  function normalizeEndpointUrl(url) {
+    return String(url || "").trim().replace(/\/+$/, "");
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -40,9 +61,19 @@
     searchTimeout: null,
     currentResults: [],
     searchCache: {}, // keyed by "mode:query" e.g. "track:adele"
-    isPlaying: null, // Currently playing Tidal track ID
-    libraryTracks: new Set(), // Set of external_ids or Tidal IDs already in library
-    hasNewChanges: false, // Track if we've added new songs
+    isPlaying: null,
+    libraryTracks: new Set(),
+    hasNewChanges: false,
+    endpointStatus: {
+      lastUpdated: null,
+      apiUp: 0,
+      streamingUp: 0,
+      down: 0,
+      source: "default",
+      loading: true,
+      error: null
+    },
+    endpointRefreshPromise: null,
 
     // Navigation state
     navigationStack: [], // Stack of {type, data, scrollPosition} for back navigation
@@ -61,6 +92,11 @@
       // Create UI
       this.createSearchPanel();
       this.createPlayerBarButton();
+
+      // Load dynamic endpoint pool (cached for 1 day)
+      this.refreshEndpointConfig().catch((err) => {
+        console.warn("[TidalSearch] Endpoint refresh failed:", err);
+      });
 
       // Retry for late DOM loading
       setTimeout(() => this.createPlayerBarButton(), 500);
@@ -282,6 +318,27 @@
                     display: flex;
                     gap: 12px;
                     margin-bottom: 16px;
+                }
+
+                .tidal-endpoint-status {
+                  margin-bottom: 12px;
+                  padding: 10px 12px;
+                  border: 1px solid var(--border-color, #404040);
+                  border-radius: 8px;
+                  background: var(--bg-surface, #222);
+                  display: flex;
+                  flex-direction: column;
+                  gap: 4px;
+                }
+
+                .tidal-endpoint-status-main {
+                  font-size: 12px;
+                  color: var(--text-primary, #fff);
+                }
+
+                .tidal-endpoint-status-counts {
+                  font-size: 11px;
+                  color: var(--text-subdued, #9a9a9a);
                 }
 
                 .tidal-search-input {
@@ -1030,6 +1087,10 @@
                         gap: 10px;
                     }
 
+                      .tidal-endpoint-status {
+                        margin: 0 16px 10px 16px;
+                      }
+
                     .tidal-search-input {
                         font-size: 16px; /* prevent iOS zoom */
                         padding: 14px 16px;
@@ -1148,6 +1209,10 @@
                     </h2>
                     <button class="tidal-close-btn" title="Close">✕</button>
                 </div>
+                  <div class="tidal-endpoint-status">
+                    <div class="tidal-endpoint-status-main">Endpoint status: loading...</div>
+                    <div class="tidal-endpoint-status-counts">API up 0 • Streaming up 0 • Down 0</div>
+                  </div>
                 <div class="tidal-search-controls">
                     <input type="text" class="tidal-search-input" placeholder="Search for music on Tidal..." autofocus>
                     <div class="tidal-mode-toggle">
@@ -1168,6 +1233,7 @@
                 </div>
             `;
       document.body.appendChild(panel);
+      this.updateEndpointStatusDisplay();
 
       // Event listeners
       panel.querySelector(".tidal-close-btn").onclick = () => this.close();
@@ -1280,6 +1346,11 @@
 
       // Refresh library tracks cache on open to capture any external changes
       this.fetchLibraryTracks();
+
+      // Refresh endpoint list if cache is stale
+      this.refreshEndpointConfig().catch((err) => {
+        console.warn("[TidalSearch] Endpoint refresh on open failed:", err);
+      });
     },
 
     close() {
@@ -1334,6 +1405,233 @@
       }
     },
 
+    getFetcher() {
+      return this.api?.fetch ? this.api.fetch.bind(this.api) : fetch;
+    },
+
+    readEndpointCache() {
+      try {
+        const raw = localStorage.getItem(ENDPOINT_CACHE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed?.payload) return null;
+        return parsed;
+      } catch (err) {
+        console.warn("[TidalSearch] Failed to read endpoint cache:", err);
+        return null;
+      }
+    },
+
+    writeEndpointCache(payload) {
+      try {
+        localStorage.setItem(
+          ENDPOINT_CACHE_KEY,
+          JSON.stringify({
+            cachedAt: Date.now(),
+            payload,
+          }),
+        );
+      } catch (err) {
+        console.warn("[TidalSearch] Failed to write endpoint cache:", err);
+      }
+    },
+
+    isCacheFresh(cachedAt) {
+      if (!cachedAt) return false;
+      return Date.now() - Number(cachedAt) < ENDPOINT_CACHE_TTL_MS;
+    },
+
+    dedupeUrls(list) {
+      const seen = new Set();
+      const out = [];
+
+      for (const item of Array.isArray(list) ? list : []) {
+        const normalized = normalizeEndpointUrl(item?.url || item);
+        if (!normalized || seen.has(normalized)) continue;
+        seen.add(normalized);
+        out.push(normalized);
+      }
+
+      return out;
+    },
+
+    applyEndpointPayload(payload) {
+      const apiUrls = this.dedupeUrls(payload?.api || []);
+      const streamUrls = this.dedupeUrls(payload?.streaming || []);
+
+      if (apiUrls.length > 0) {
+        API_ENDPOINTS.SEARCH = apiUrls;
+        API_ENDPOINTS.DETAILS = apiUrls[0];
+      }
+
+      if (streamUrls.length > 0) {
+        API_ENDPOINTS.STREAM = streamUrls;
+      }
+    },
+
+    formatTimestamp(ts) {
+      if (!ts) return "unknown";
+      const d = new Date(ts);
+      if (Number.isNaN(d.getTime())) return "unknown";
+      return d.toLocaleString();
+    },
+
+    updateEndpointStatusDisplay() {
+      const mainEl = document.querySelector(".tidal-endpoint-status-main");
+      const countsEl = document.querySelector(".tidal-endpoint-status-counts");
+      if (!mainEl || !countsEl) return;
+
+      if (this.endpointStatus.loading) {
+        mainEl.textContent = "Endpoint status: checking...";
+        countsEl.textContent = "API up 0 • Streaming up 0 • Down 0";
+        return;
+      }
+
+      const sourceText = this.endpointStatus.source
+        ? ` (${this.endpointStatus.source})`
+        : "";
+
+      mainEl.textContent = this.endpointStatus.error
+        ? `Endpoint status: using defaults${sourceText}`
+        : `Last API update: ${this.formatTimestamp(this.endpointStatus.lastUpdated)}${sourceText}`;
+
+      countsEl.textContent = `API up ${this.endpointStatus.apiUp} • Streaming up ${this.endpointStatus.streamingUp} • Down ${this.endpointStatus.down}`;
+    },
+
+    async fetchEndpointPayloadFrom(sourceUrl) {
+      const fetcher = this.getFetcher();
+      const response = await fetcher(sourceUrl);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+      if (!data || (!Array.isArray(data.api) && !Array.isArray(data.streaming))) {
+        throw new Error("Invalid endpoint payload");
+      }
+
+      return data;
+    },
+
+    async refreshEndpointConfig(force = false) {
+      if (this.endpointRefreshPromise && !force) {
+        return this.endpointRefreshPromise;
+      }
+
+      this.endpointStatus.loading = true;
+      this.endpointStatus.error = null;
+      this.updateEndpointStatusDisplay();
+
+      this.endpointRefreshPromise = (async () => {
+        const cached = this.readEndpointCache();
+
+        if (!force && cached?.payload && this.isCacheFresh(cached.cachedAt)) {
+          this.applyEndpointPayload(cached.payload);
+          this.endpointStatus = {
+            ...this.endpointStatus,
+            loading: false,
+            error: null,
+            source: "cache",
+            lastUpdated: cached.payload.lastUpdated || new Date(cached.cachedAt).toISOString(),
+            apiUp: Array.isArray(cached.payload.api) ? cached.payload.api.length : 0,
+            streamingUp: Array.isArray(cached.payload.streaming) ? cached.payload.streaming.length : 0,
+            down: Array.isArray(cached.payload.down) ? cached.payload.down.length : 0,
+          };
+          this.updateEndpointStatusDisplay();
+          return;
+        }
+
+        let payload = null;
+        let source = null;
+        let lastErr = null;
+
+        for (const sourceUrl of UPTIME_ENDPOINT_SOURCES) {
+          try {
+            payload = await this.fetchEndpointPayloadFrom(sourceUrl);
+            source = sourceUrl;
+            break;
+          } catch (err) {
+            lastErr = err;
+            console.warn(`[TidalSearch] Uptime source failed: ${sourceUrl}`, err);
+          }
+        }
+
+        if (!payload && cached?.payload) {
+          payload = cached.payload;
+          source = "stale-cache";
+        }
+
+        if (!payload) {
+          this.endpointStatus = {
+            ...this.endpointStatus,
+            loading: false,
+            error: lastErr ? String(lastErr.message || lastErr) : "Unable to fetch endpoint status",
+            source: "default",
+            lastUpdated: null,
+            apiUp: Array.isArray(API_ENDPOINTS.SEARCH) ? API_ENDPOINTS.SEARCH.length : 0,
+            streamingUp: Array.isArray(API_ENDPOINTS.STREAM) ? API_ENDPOINTS.STREAM.length : 0,
+            down: 0,
+          };
+          this.updateEndpointStatusDisplay();
+          return;
+        }
+
+        this.applyEndpointPayload(payload);
+        this.writeEndpointCache(payload);
+
+        this.endpointStatus = {
+          ...this.endpointStatus,
+          loading: false,
+          error: null,
+          source,
+          lastUpdated: payload.lastUpdated || new Date().toISOString(),
+          apiUp: Array.isArray(payload.api) ? payload.api.length : 0,
+          streamingUp: Array.isArray(payload.streaming) ? payload.streaming.length : 0,
+          down: Array.isArray(payload.down) ? payload.down.length : 0,
+        };
+        this.updateEndpointStatusDisplay();
+      })()
+        .finally(() => {
+          this.endpointRefreshPromise = null;
+        });
+
+      return this.endpointRefreshPromise;
+    },
+
+    getApiEndpointsForDetails() {
+      const all = [
+        API_ENDPOINTS.DETAILS,
+        ...(Array.isArray(API_ENDPOINTS.SEARCH) ? API_ENDPOINTS.SEARCH : []),
+      ].map(normalizeEndpointUrl).filter(Boolean);
+
+      return [...new Set(all)];
+    },
+
+    async fetchJsonWithApiFallback(pathnameAndQuery) {
+      const endpoints = this.getApiEndpointsForDetails();
+      let lastError = null;
+
+      for (const endpoint of endpoints) {
+        try {
+          const url = `${endpoint}${pathnameAndQuery}`;
+          const response = this.api.fetch
+            ? await this.api.fetch(url)
+            : await fetch(url);
+
+          if (!response.ok) {
+            lastError = new Error(`HTTP ${response.status}`);
+            continue;
+          }
+
+          return await response.json();
+        } catch (err) {
+          lastError = err;
+        }
+      }
+
+      throw lastError || new Error("All API endpoints failed");
+    },
+
     // ═══════════════════════════════════════════════════════════════════════
     // SEARCH FUNCTIONALITY
     // ═══════════════════════════════════════════════════════════════════════
@@ -1386,7 +1684,7 @@
 
         let data = null;
 
-        for (const baseUrl of shuffled(ALL_SEARCH_MIRRORS)) {
+        for (const baseUrl of shuffled(API_ENDPOINTS.SEARCH)) {
           try {
             const url = `${baseUrl}/search/?${param}=${encodeURIComponent(query)}`;
             // Use CORS-free fetch via Tauri backend
@@ -1902,9 +2200,12 @@
       };
 
       const qualitiesToTry = [quality, ...(QUALITY_FALLBACKS[quality] || [])];
+      const streamEndpoints = Array.isArray(API_ENDPOINTS.STREAM)
+        ? API_ENDPOINTS.STREAM
+        : [API_ENDPOINTS.STREAM];
 
       for (const currentQuality of qualitiesToTry) {
-        for (const baseUrl of shuffled(ALL_MIRRORS)) {
+        for (const baseUrl of shuffled(streamEndpoints)) {
           const url = `${baseUrl}/track/?id=${trackId}&quality=${currentQuality}`;
           try {
             // Use CORS-free fetch via Tauri backend
@@ -1948,7 +2249,7 @@
         let data = null;
         let successMirror = null;
 
-        const mirrors = shuffled(ALL_SEARCH_MIRRORS);
+        const mirrors = shuffled(API_ENDPOINTS.SEARCH);
         console.log(`${tag} Trying ${mirrors.length} mirrors...`);
 
         for (const baseUrl of mirrors) {
@@ -2055,7 +2356,7 @@
         // Fetch from Tidal API
         let data = null;
 
-        for (const baseUrl of shuffled(ALL_SEARCH_MIRRORS)) {
+        for (const baseUrl of shuffled(API_ENDPOINTS.SEARCH)) {
           try {
             const url = `${baseUrl}/search/?a=${encodeURIComponent(artistName)}`;
             const response = this.api.fetch
@@ -2323,24 +2624,8 @@
       this.showLoading();
 
       try {
-        let data = null;
-
-        for (const baseUrl of shuffled(ALL_MIRRORS)) {
-          try {
-            const url = `${baseUrl}/artist/?f=${artistId}`;
-            const response = this.api.fetch
-              ? await this.api.fetch(url)
-              : await fetch(url);
-            if (!response.ok) continue;
-            data = await response.json();
-            console.log(`[TidalSearch] Artist data from ${baseUrl}`);
-            break;
-          } catch (e) {
-            console.warn(`[TidalSearch] Artist fetch failed on ${baseUrl}:`, e.message);
-          }
-        }
-
-        if (!data) throw new Error("All mirrors failed to fetch artist");
+        const data = await this.fetchJsonWithApiFallback(`/artist/?f=${artistId}`);
+        console.log("[TidalSearch] Artist data:", data);
         this.renderArtistPage(data);
       } catch (err) {
         console.error("[TidalSearch] Failed to fetch artist:", err);
@@ -2382,24 +2667,8 @@
       this.showLoading();
 
       try {
-        let data = null;
-
-        for (const baseUrl of shuffled(ALL_MIRRORS)) {
-          try {
-            const url = `${baseUrl}/album/?id=${albumId}`;
-            const response = this.api.fetch
-              ? await this.api.fetch(url)
-              : await fetch(url);
-            if (!response.ok) continue;
-            data = await response.json();
-            console.log(`[TidalSearch] Album data from ${baseUrl}`);
-            break;
-          } catch (e) {
-            console.warn(`[TidalSearch] Album fetch failed on ${baseUrl}:`, e.message);
-          }
-        }
-
-        if (!data) throw new Error("All mirrors failed to fetch album");
+        const data = await this.fetchJsonWithApiFallback(`/album/?id=${albumId}`);
+        console.log("[TidalSearch] Album data:", data);
         this.renderAlbumPage(data);
       } catch (err) {
         console.error("[TidalSearch] Failed to fetch album:", err);
