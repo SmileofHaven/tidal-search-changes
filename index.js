@@ -24,6 +24,11 @@
     ]
   };
 
+  // Temporary safeguard: direct DASH segment playback from TIDAL CDN is blocked
+  // by CORS in browser/dev environments and can fail with upstream 403.
+  // Keep this off until a local relay/proxy path is implemented.
+  const ENABLE_TIDAL_DASH_PLAYBACK = false;
+
   const UPTIME_ENDPOINT_SOURCES = [
     "https://tidal-uptime.jiffy-puffs-1j.workers.dev/",
     "https://tidal-uptime.props-76styles.workers.dev/"
@@ -111,7 +116,7 @@
             externalId,
           );
           try {
-            const quality = options?.quality || "HI_RES_LOSSLESS";
+            const quality = options?.quality || "LOSSLESS";
             // fetchStream handles mirror rotation and full quality fallback chain
             const streamData = await this.fetchStream(externalId, quality);
             const streamUrl = this.decodeManifest(streamData.data);
@@ -2115,7 +2120,7 @@
     
       try {
         const quality =
-          document.getElementById("tidal-quality")?.value || "HI_RES_LOSSLESS";
+          document.getElementById("tidal-quality")?.value || "LOSSLESS";
     
         // fetchStream handles mirror rotation and full quality fallback chain
         const streamData = await this.fetchStream(track.id, quality);
@@ -2222,6 +2227,18 @@
 
             if (!data?.data?.manifest) {
               console.warn(`[TidalSearch] No manifest from ${baseUrl} @ ${currentQuality}`);
+              continue;
+            }
+
+            // Avoid MPD/DASH output until we have a local relay for segment requests.
+            // Direct browser requests to TIDAL CDN segments are frequently blocked.
+            if (
+              data?.data?.manifestMimeType === "application/dash+xml" &&
+              !ENABLE_TIDAL_DASH_PLAYBACK
+            ) {
+              console.warn(
+                `[TidalSearch] Skipping DASH manifest from ${baseUrl} @ ${currentQuality}; falling back to non-DASH quality`
+              );
               continue;
             }
 
@@ -2557,6 +2574,10 @@
             return manifest.urls[0];
           }
         } else if (manifestMimeType === "application/dash+xml") {
+          if (!ENABLE_TIDAL_DASH_PLAYBACK) {
+            console.warn("[TidalSearch] DASH manifest received but DASH playback is disabled");
+            return null;
+          }
           console.log("[TidalSearch] MPD manifest, returning as blob URL for dash.js");
           const blob = new Blob([manifestStr], { type: "application/dash+xml" });
           return URL.createObjectURL(blob);
